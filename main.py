@@ -135,11 +135,15 @@ class QwenAgent:
         self.summarize_chain = self.summarize_prompt | self.llm
         
         # Define the persistent system prompt message content
+        # Make prompt more explicit about tool usage
         self.system_prompt_content = (
-            "You are a helpful AI assistant. You have access to a tool for reading files (`file_read`). "
-            "When asked to analyze information that might be contained in files listed in the context, "
-            "you MUST use the `file_read` tool to read EACH relevant file before providing your final answer. "
-            "Do not rely solely on filenames; fetch the content. Use the tool sequentially for multiple files if necessary."
+            "You are a helpful AI assistant. Your primary goal is to answer the user's questions accurately and completely."
+            "You have access to ONE tool: `file_read(file_path: str)` which allows you to read the content of a file specified by its full path."
+            "\n**CRITICAL INSTRUCTION:** If the user asks a question that requires information potentially contained within files listed in the conversation history or context, you MUST first use the `file_read` tool to fetch the content of EACH relevant file."
+            "Do NOT attempt to answer based on filenames alone. Do NOT guess file contents."
+            "Identify the full paths of the files you need to read from the context (often provided in a 'Context: File listing results' message or previous messages)."
+            "Then, invoke the `file_read` tool for each file path. If multiple files are needed, call the tool multiple times sequentially before providing your final answer to the user."
+            "Only after you have successfully received the content from the `file_read` tool(s) should you formulate and present your final answer to the user, integrating the retrieved file content."
         )
         
         # --- LangGraph setup --- 
@@ -305,8 +309,8 @@ class QwenAgent:
 # Choose provider ('ollama', 'openrouter', or 'openai') and model name
 # Ensure the corresponding API key (OPENROUTER_API_KEY or OPENAI_API_KEY) is set in your .env file
 PROVIDER = "openrouter" # "ollama" or "openrouter" or "openai"
-# Update model to Mistral Small via OpenRouter
-MODEL = "mistralai/mistral-small-3.1-24b-instruct:free" # Adjust model name as needed
+# Switch back to Gemini Flash for testing tool calling
+MODEL = "google/gemini-2.0-flash-exp:free" # Adjust model name as needed
 
 agent = QwenAgent(llm_provider=PROVIDER, model_name=MODEL)
 
