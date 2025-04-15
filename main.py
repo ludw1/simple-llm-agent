@@ -1,5 +1,7 @@
 import pymupdf4llm
 import os
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -14,7 +16,10 @@ from langchain_core.prompts import ChatPromptTemplate
 #            """
 
 # Define summarization threshold (e.g., characters)
-SUMMARIZATION_THRESHOLD = 2000 
+SUMMARIZATION_THRESHOLD = 2000
+
+# Load environment variables from .env file
+load_dotenv()
 
 def load_file(file_path: str) -> str:
     """Load a file and return its content. Depending on the file type, different methods can be used to read it.
@@ -47,45 +52,38 @@ def file_read(file_path: str) -> str:
 
 # Make request_files a regular helper function, no longer a tool
 def request_files(directory: str = ".") -> str:
-    """Recursively lists files and directories, showing the structure.
-    If directory is unspecified, lists the current directory."""
-    print(f"Helper: Recursively listing directory structure: {directory}")
-    output_lines = []
+    """Recursively lists full paths of files within a directory."""
+    print(f"Helper: Recursively listing full file paths in: {directory}")
+    file_paths = []
 
     try:
         abs_directory = os.path.abspath(directory)
         if not os.path.isdir(abs_directory):
             return f"Error: Directory '{directory}' does not exist or is not accessible."
 
-        # Get the starting path's base name for the root display
-        start_dir_name = os.path.basename(abs_directory) or '.'
-        output_lines.append(f"[{start_dir_name}/]")
-        start_level = abs_directory.count(os.path.sep)
-
         for root, dirs, files in os.walk(abs_directory, topdown=True):
             # Filter directories to avoid traversing into them
             dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__', '.vscode', '.venv')]
-            # Filter files (optional)
-            # files = [f for f in files if f not in ('.gitignore')]
+            
+            # Collect full paths for files in the current directory
+            for filename in files:
+                # Optional: Filter specific files like .gitignore if needed
+                # if filename == '.gitignore':
+                #     continue
+                if "thesis" in filename:
+                    continue
+                full_path = os.path.join(root, filename)
+                file_paths.append(full_path)
 
-            level = os.path.abspath(root).count(os.path.sep) - start_level
-            indent = "    " * (level + 1) # Indent subitems further
-
-            # List directories
-            for d in sorted(dirs):
-                output_lines.append(f"{indent}[{d}/]")
-
-            # List files
-            for f in sorted(files):
-                output_lines.append(f"{indent}{f}")
-
-        # Add a newline at the start for better formatting in context
-        return "\n" + "\n".join(output_lines)
+        if not file_paths:
+            return "No files found in the specified directory."
+            
+        # Format the output as a simple list
+        return "\nAvailable files:\n" + "\n".join(sorted(file_paths))
 
     except Exception as e:
-        # Print the exception for debugging
         print(f"Error during os.walk in {directory}: {str(e)}") 
-        return f"Error listing directory {directory}: {str(e)}"
+        return f"Error listing files in directory {directory}: {str(e)}"
 
 # QwenAgent class
 class QwenAgent:
@@ -93,24 +91,56 @@ class QwenAgent:
     class AgentState(TypedDict):
         messages: Annotated[list, add_messages]
 
-    def __init__(self):
+    def __init__(self, llm_provider: str = "ollama", model_name: str = "qwen2.5:7b"):
         self.chat_history = [] 
         # Define tools list - only file_read now
         _tools_list = [file_read]
         # Create tool map - only file_read
         self.tool_map = {tool.name: tool for tool in _tools_list}
 
-        # Set up Langchain model
-        self.llm = ChatOllama(model="qwen2.5:7b", temperature=0.2)
+        # Set up Langchain model based on provider
+        if llm_provider == "ollama":
+            self.llm = ChatOllama(model=model_name, temperature=0.2)
+            print(f"Using Ollama model: {model_name}")
+        elif llm_provider == "openrouter":
+            # Ensure OPENROUTER_API_KEY is set in environment (loaded from .env)
+            api_key = os.getenv("OPENROUTER_API_KEY")
+            if not api_key:
+                raise ValueError("OPENROUTER_API_KEY not found in environment or .env file.")
+            # Use ChatOpenAI configured for OpenRouter
+            self.llm = ChatOpenAI(
+                model=model_name, 
+                temperature=0.2, 
+                openai_api_key=api_key, 
+                openai_api_base="https://openrouter.ai/api/v1"
+            )
+            print(f"Using OpenRouter via ChatOpenAI: {model_name}")
+        elif llm_provider == "openai":
+            # Ensure OPENAI_API_KEY is set in environment (loaded from .env)
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY not found in environment or .env file.")
+            self.llm = ChatOpenAI(model=model_name, temperature=0.2, openai_api_key=api_key)
+            print(f"Using OpenAI model: {model_name}")
+        else:
+            raise ValueError(f"Unsupported LLM provider: {llm_provider}")
 
         # Bind the remaining tool (file_read) to the LLM
         self.llm_with_tools = self.llm.bind_tools(_tools_list)
         
         # Create summarization prompt and chain
         self.summarize_prompt = ChatPromptTemplate.from_template(
-            "Summarize the following text concisely to maintain context in an ongoing conversation:\n\n{text}"
+            "Summarize the following text concisely to maintain context in an ongoing conversation. Make sure to also include specific style points with examples from this text in your summary:\n\n{text}"
         )
         self.summarize_chain = self.summarize_prompt | self.llm
+        
+        # Define the persistent system prompt message content
+        self.system_prompt_content = (
+            "You are a helpful AI assistant. You have access to a tool for reading files (`file_read`). "
+            "When asked to analyze information that might be contained in files listed in the context, "
+            "you MUST use the `file_read` tool to read EACH relevant file before providing your final answer. "
+            "Do not rely solely on filenames; fetch the content. Use the tool sequentially for multiple files if necessary."
+        )
         
         # --- LangGraph setup --- 
         self.graph = self._build_graph()
@@ -124,7 +154,8 @@ class QwenAgent:
         # Directly call the helper function
         try:
             response = request_files(directory_to_list)
-            message_content = f"Context: Current directory listing is - {response}"
+            # Update the context message format
+            message_content = f"Context: File listing results - {response}"
         except Exception as e:
             print(f"Error calling request_files helper: {e}")
             message_content = f"Error listing directory: {e}"
@@ -140,9 +171,15 @@ class QwenAgent:
     def _call_model(self, state):
         print("--- Calling Model ---")
         messages = state["messages"]
-        response = self.llm_with_tools.invoke(messages)
+        # Create the system message
+        system_message = SystemMessage(content=self.system_prompt_content)
+        # Prepend the system message to the current messages
+        messages_with_system = [system_message] + messages
+        print(f"Messages sent to LLM: {messages_with_system}")
+        response = self.llm_with_tools.invoke(messages_with_system)
         print(f"Model response: {response}")
-        # We return a list, because this will get added to the existing list
+        # We return a list, because this will get added to the existing list via add_messages
+        # Note: We only return the LLM's response, not the system prompt we added
         return {"messages": [response]}
 
     # Define the function to execute tools
@@ -183,60 +220,6 @@ class QwenAgent:
         # We return a list, because this will get added to the existing list (via add_messages)
         return {"messages": tool_messages}
 
-    # Define the function to summarize tool results if needed
-    def _summarize_tool_results(self, state):
-        """Checks the last ToolMessage(s) and summarizes content if it exceeds the threshold."""
-        print("--- Summarizing Tool Results (If Needed) ---")
-        messages = state["messages"]
-        last_message = messages[-1]
-        updated_messages = []
-        
-        # Check if the last message is a ToolMessage (or potentially multiple if _call_tool returns a list)
-        # For simplicity, let's focus on summarizing the *last* message if it's a tool result.
-        # A more robust approach might handle multiple tool messages from a single _call_tool step.
-        
-        # Let's iterate backwards to find the most recent tool messages to summarize
-        messages_to_keep = []
-        summarized_something = False
-        for msg in reversed(messages):
-            if isinstance(msg, ToolMessage):
-                if len(msg.content) > SUMMARIZATION_THRESHOLD:
-                    print(f"Summarizing ToolMessage (ID: {msg.tool_call_id}, Length: {len(msg.content)} chars)")
-                    try:
-                        summary_response = self.summarize_chain.invoke({"text": msg.content})
-                        summary_content = summary_response.content
-                        print(f"Summary: {summary_content}")
-                        # Create a new ToolMessage with summarized content, keeping original ID
-                        summarized_msg = ToolMessage(
-                            content=f"Summary of previous tool call: {summary_content}",
-                            tool_call_id=msg.tool_call_id,
-                            name=msg.name # Keep original name if present
-                        )
-                        messages_to_keep.append(summarized_msg)
-                        summarized_something = True
-                    except Exception as e:
-                        print(f"Error summarizing ToolMessage ID {msg.tool_call_id}: {e}")
-                        # Keep original message if summarization fails
-                        messages_to_keep.append(msg) 
-                else:
-                    # Keep ToolMessage as is (below threshold)
-                    messages_to_keep.append(msg)
-            else:
-                # Stop when we hit a non-ToolMessage, keep it and everything before it
-                messages_to_keep.append(msg)
-                break
-                
-        if summarized_something:
-            # Reconstruct the messages list in the original order
-            final_messages = list(reversed(messages_to_keep)) + messages[:-len(messages_to_keep)]
-            # Return the updated state dictionary
-            return {"messages": final_messages}
-        else:
-            # No summarization occurred, return state unchanged (or signal no change)
-            print("No summarization needed.")
-            # Returning the original state dictionary to avoid modifying state unnecessarily
-            return state 
-
     # Define the function that determines whether to continue or not
     def _should_continue(self, state):
         print("--- Checking if should continue ---")
@@ -258,7 +241,6 @@ class QwenAgent:
         graph.add_node("list_directory", self._list_directory)
         graph.add_node("agent", self._call_model)
         graph.add_node("action", self._call_tool)
-        graph.add_node("summarize_results", self._summarize_tool_results) # New summarization node
 
         # Set the entrypoint 
         graph.set_entry_point("list_directory")
@@ -276,11 +258,8 @@ class QwenAgent:
             },
         )
 
-        # Edge from action to summarization
-        graph.add_edge("action", "summarize_results")
-
-        # Edge from summarization back to agent
-        graph.add_edge("summarize_results", "agent")
+        # Edge from action back to agent (removed summarization)
+        graph.add_edge("action", "agent")
 
         # Finally, we compile the graph
         print("Compiling graph...")
@@ -322,7 +301,15 @@ class QwenAgent:
         # Return the response content string
         return final_response
 
-agent = QwenAgent()
+# Example usage:
+# Choose provider ('ollama', 'openrouter', or 'openai') and model name
+# Ensure the corresponding API key (OPENROUTER_API_KEY or OPENAI_API_KEY) is set in your .env file
+PROVIDER = "openrouter" # "ollama" or "openrouter" or "openai"
+# Update model to Mistral Small via OpenRouter
+MODEL = "mistralai/mistral-small-3.1-24b-instruct:free" # Adjust model name as needed
+
+agent = QwenAgent(llm_provider=PROVIDER, model_name=MODEL)
+
 # Example loop for interactive chat
 while True:
     try:

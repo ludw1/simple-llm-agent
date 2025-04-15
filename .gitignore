@@ -1,4 +1,3 @@
 /.venv
-/dummy.txt
-/dummy2.txt
-/kraemer_cv.pdf
+.env
+*.pdf
