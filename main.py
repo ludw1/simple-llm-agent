@@ -11,12 +11,10 @@ from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated
 from langchain_core.prompts import ChatPromptTemplate
 
-# Remove unused system_prompt
-# system_prompt = """[SYSTEM] You are an AI assistant capable of using various tools...
-#            """
 
-# Define summarization threshold (e.g., characters)
-SUMMARIZATION_THRESHOLD = 2000
+# --- Configuration --- 
+# Maximum number of tool call iterations per user turn
+MAX_TOOL_CALLS_PER_TURN = 3 
 
 # Load environment variables from .env file
 load_dotenv()
@@ -70,7 +68,7 @@ def request_files(directory: str = ".") -> str:
                 # Optional: Filter specific files like .gitignore if needed
                 # if filename == '.gitignore':
                 #     continue
-                if "thesis" in filename:
+                if "thesis" in filename or ".env" in filename:
                     continue
                 full_path = os.path.join(root, filename)
                 file_paths.append(full_path)
@@ -94,75 +92,81 @@ class QwenAgent:
     - List files in the workspace.
     - Use a `file_read` tool to ingest file content (text/PDF).
     - Interact with configurable LLM providers (Ollama, OpenRouter, OpenAI).
+    - Optionally use separate LLMs for tool usage and final writing.
     """
     # Define the state for the graph
     class AgentState(TypedDict):
         """Represents the state of the agent graph, primarily the message history."""
         messages: Annotated[list, add_messages]
+        # Add counter for tool calls within a turn
+        tool_calls_this_turn: int
 
-    def __init__(self, llm_provider: str = "ollama", model_name: str = "qwen2.5:7b"):
-        """Initializes the QwenAgent.
+    # Update __init__ for two LLMs
+    def __init__(self, 
+                 tool_llm_provider: str = "openrouter", 
+                 tool_llm_model: str = "google/gemini-2.0-flash-exp:free",
+                 writer_llm_provider: str = "openrouter",
+                 writer_llm_model: str = "arliai/qwq-32b-arliai-rpr-v1:free"
+                 ):
+        """Initializes the QwenAgent with potentially separate tool and writer LLMs.
 
         Args:
-            llm_provider: The LLM provider to use ('ollama', 'openrouter', 'openai').
-            model_name: The specific model name for the chosen provider.
+            tool_llm_provider: The provider for the LLM handling tool calls.
+            tool_llm_model: The model name for the tool LLM.
+            writer_llm_provider: The provider for the LLM handling final writing/synthesis.
+            writer_llm_model: The model name for the writer LLM.
         """
-        self.chat_history = [] 
-        # Define tools list - only file_read now
+        self.chat_history = []
         _tools_list = [file_read]
-        # Create tool map - only file_read
         self.tool_map = {tool.name: tool for tool in _tools_list}
 
-        # Set up Langchain model based on provider
-        if llm_provider == "ollama":
-            self.llm = ChatOllama(model=model_name, temperature=0.2)
-            print(f"Using Ollama model: {model_name}")
-        elif llm_provider == "openrouter":
-            # Ensure OPENROUTER_API_KEY is set in environment (loaded from .env)
+        # --- Initialize Tool LLM --- 
+        print(f"Initializing Tool LLM: Provider={tool_llm_provider}, Model={tool_llm_model}")
+        self.tool_llm = self._initialize_llm(tool_llm_provider, tool_llm_model)
+        # Bind tools ONLY to the tool_llm
+        self.tool_llm_with_tools = self.tool_llm.bind_tools(_tools_list)
+
+        # --- Initialize Writer LLM --- 
+        print(f"Initializing Writer LLM: Provider={writer_llm_provider}, Model={writer_llm_model}")
+        # Initialize writer LLM WITHOUT binding tools
+        self.writer_llm = self._initialize_llm(writer_llm_provider, writer_llm_model)
+
+        # Define the persistent system prompt message content (primarily for tool LLM)
+        self.system_prompt_content = (
+            "You are an orchestrator assistant. Your primary goal is to use tools effectively to gather information needed to answer the user's query."
+            "You have access to ONE tool: `file_read(file_path: str)` which allows you to read the content of a file specified by its full path."
+            "\n**CRITICAL INSTRUCTION:** If the user asks a question that requires information potentially contained within files listed in the context, you MUST use the `file_read` tool to fetch the content of EACH relevant file."
+            "Do NOT attempt to answer the question directly yourself, even if you think you know the answer or have the information from tool calls already."
+            "Your job is to call the tool(s). Another assistant will synthesize the final answer."
+            "Identify the full paths of the files you need to read from the context."
+            "Then, invoke the `file_read` tool for each file path sequentially."
+            "If no tool call is needed, or after you have made all necessary tool calls, stop and let the other assistant respond."
+        )
+
+        # Build and compile the state graph
+        self.graph = self._build_graph()
+
+    def _initialize_llm(self, provider: str, model_name: str):
+        """Helper function to initialize an LLM client based on provider and model name."""
+        if provider == "ollama":
+            return ChatOllama(model=model_name, temperature=0.2)
+        elif provider == "openrouter":
             api_key = os.getenv("OPENROUTER_API_KEY")
             if not api_key:
                 raise ValueError("OPENROUTER_API_KEY not found in environment or .env file.")
-            # Use ChatOpenAI configured for OpenRouter
-            self.llm = ChatOpenAI(
-                model=model_name, 
-                temperature=0.2, 
-                openai_api_key=api_key, 
+            return ChatOpenAI(
+                model=model_name,
+                temperature=0.2,
+                openai_api_key=api_key,
                 openai_api_base="https://openrouter.ai/api/v1"
             )
-            print(f"Using OpenRouter via ChatOpenAI: {model_name}")
-        elif llm_provider == "openai":
-            # Ensure OPENAI_API_KEY is set in environment (loaded from .env)
+        elif provider == "openai":
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
                 raise ValueError("OPENAI_API_KEY not found in environment or .env file.")
-            self.llm = ChatOpenAI(model=model_name, temperature=0.2, openai_api_key=api_key)
-            print(f"Using OpenAI model: {model_name}")
+            return ChatOpenAI(model=model_name, temperature=0.2, openai_api_key=api_key)
         else:
-            raise ValueError(f"Unsupported LLM provider: {llm_provider}")
-
-        # Bind the remaining tool (file_read) to the LLM
-        self.llm_with_tools = self.llm.bind_tools(_tools_list)
-        
-        # Create summarization prompt and chain
-        self.summarize_prompt = ChatPromptTemplate.from_template(
-            "Summarize the following text concisely to maintain context in an ongoing conversation. Make sure to also include specific style points with examples from this text in your summary:\n\n{text}"
-        )
-        self.summarize_chain = self.summarize_prompt | self.llm
-        
-        # Define the persistent system prompt message content
-        # Make prompt more explicit about tool usage
-        self.system_prompt_content = (
-            "You are a helpful AI assistant. Your primary goal is to answer the user's questions accurately and completely."
-            "You have access to ONE tool: `file_read(file_path: str)` which allows you to read the content of a file specified by its full path."
-            "\n**CRITICAL INSTRUCTION:** If the user asks a question that requires information potentially contained within files listed in the conversation history or context, you MUST first use the `file_read` tool to fetch the content of EACH relevant file."
-            "Do NOT attempt to answer based on filenames alone. Do NOT guess file contents."
-            "Identify the full paths of the files you need to read from the context (often provided in a 'Context: File listing results' message or previous messages)."
-            "Then, invoke the `file_read` tool for each file path. If multiple files are needed, call the tool multiple times sequentially before providing your final answer to the user."
-            "Only after you have successfully received the content from the `file_read` tool(s) should you formulate and present your final answer to the user, integrating the retrieved file content."
-        )
-        
-        # --- LangGraph setup --- 
-        self.graph = self._build_graph()
+            raise ValueError(f"Unsupported LLM provider: {provider}")
 
     # Define the function that lists the directory content first
     def _list_directory(self, state: AgentState) -> dict:
@@ -196,10 +200,27 @@ class QwenAgent:
         # Prepend the system message to the current messages
         messages_with_system = [system_message] + messages
         print(f"Messages sent to LLM: {messages_with_system}")
-        response = self.llm_with_tools.invoke(messages_with_system)
+        response = self.tool_llm_with_tools.invoke(messages_with_system)
         print(f"Model response: {response}")
         # We return a list, because this will get added to the existing list via add_messages
         # Note: We only return the LLM's response, not the system prompt we added
+        return {"messages": [response]}
+
+    # --- New Node: Call Writer LLM --- 
+    def _call_writer_model(self, state: AgentState) -> dict:
+        """Graph Node: Invokes the writer LLM to synthesize the final response."""
+        print("--- Calling Writer Model ---")
+        # Get all messages except the initial system prompt for the tool_llm
+        messages = state["messages"]
+        
+        writer_system_prompt = SystemMessage(content="You are a helpful AI assistant. Synthesize the information provided in the previous messages (including tool results) to answer the user's final query comprehensively. If asked to write in a specific style, analyze the provided text samples and mimic the style in your response.")
+        messages_for_writer = [writer_system_prompt] + messages
+
+        print(f"Messages sent to Writer LLM: {messages_for_writer}")
+        # Invoke the writer LLM (without tools)
+        response = self.writer_llm.invoke(messages_for_writer)
+        print(f"Writer Model response: {response}")
+        # Return the final response to be added to the state
         return {"messages": [response]}
 
     # Define the function to execute tools
@@ -211,7 +232,7 @@ class QwenAgent:
         # Ensure last_message is an AIMessage with tool_calls
         if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
              print("No valid tool calls found in the last AI message.")
-             return {"messages": []} 
+             return {"messages": [], "tool_calls_this_turn": state.get('tool_calls_this_turn', 0)} 
 
         tool_messages = []
         for tool_call in last_message.tool_calls:
@@ -238,22 +259,37 @@ class QwenAgent:
             tool_messages.append(ToolMessage(content=response_content, name=tool_name, tool_call_id=tool_id))
 
         print(f"Tool responses: {tool_messages}")
+        # Increment the counter for this turn
+        current_count = state.get('tool_calls_this_turn', 0)
+        new_count = current_count + 1
+        print(f"Tool call iteration {new_count}/{MAX_TOOL_CALLS_PER_TURN} for this turn.")
         # We return a list, because this will get added to the existing list (via add_messages)
-        return {"messages": tool_messages}
+        # Also return the updated counter
+        return {"messages": tool_messages, "tool_calls_this_turn": new_count}
 
     # Define the function that determines whether to continue or not
     def _should_continue(self, state: AgentState) -> str:
-        """Graph Node: Determines the next step based on the last message (tool call or end)."""
+        """Graph Node: Determines the next step based on the last message and tool call limit."""
         print("--- Checking if should continue ---")
         last_message = state["messages"][-1]
-        # If there are no tool calls, then we finish
-        if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
-            print("Decision: End")
-            return "end"
-        # Otherwise if there are tool calls, we continue
+        tool_calls_made = state.get('tool_calls_this_turn', 0)
+        
+        # Check if the LLM requested tool calls
+        has_tool_calls = hasattr(last_message, 'tool_calls') and last_message.tool_calls
+
+        if has_tool_calls:
+            # Check if we've exceeded the limit for this turn
+            if tool_calls_made >= MAX_TOOL_CALLS_PER_TURN:
+                print(f"Decision: Tool call limit ({MAX_TOOL_CALLS_PER_TURN}) reached. Forcing end of tool loop.")
+                return "end"
+            else:
+                # Limit not reached, continue tool execution
+                print(f"Decision: Continue tool execution (Iteration {tool_calls_made + 1})")
+                return "continue"
         else:
-            print("Decision: Continue")
-            return "continue"
+            # No tool calls requested by LLM
+            print("Decision: End (No tool calls requested)")
+            return "end"
 
     def _build_graph(self) -> StateGraph:
         """Builds and compiles the LangGraph StateGraph for the agent."""
@@ -264,6 +300,7 @@ class QwenAgent:
         graph.add_node("list_directory", self._list_directory)
         graph.add_node("agent", self._call_model)
         graph.add_node("action", self._call_tool)
+        graph.add_node("writer", self._call_writer_model)
 
         # Set the entrypoint 
         graph.set_entry_point("list_directory")
@@ -277,12 +314,15 @@ class QwenAgent:
             self._should_continue,
             {
                 "continue": "action", # If tool call needed, go to action
-                "end": END,
+                "end": "writer",      # If no tool call needed, go to writer
             },
         )
 
         # Edge from action back to agent (removed summarization)
         graph.add_edge("action", "agent")
+
+        # Edge from writer to END
+        graph.add_edge("writer", END)
 
         # Finally, we compile the graph
         print("Compiling graph...")
@@ -310,7 +350,8 @@ class QwenAgent:
         self.chat_history.append(human_message)
 
         # Prepare the initial state for this invocation using the history
-        initial_state = {"messages": self.chat_history}
+        # Initialize the tool call counter for this turn
+        initial_state = {"messages": self.chat_history, "tool_calls_this_turn": 0}
         print(f"Invoking graph with state: {initial_state}")
 
         # Invoke the graph
@@ -334,13 +375,22 @@ class QwenAgent:
         return final_response
 
 # Example usage:
-# Choose provider ('ollama', 'openrouter', or 'openai') and model name
-# Ensure the corresponding API key (OPENROUTER_API_KEY or OPENAI_API_KEY) is set in your .env file
-PROVIDER = "openrouter" # "ollama" or "openrouter" or "openai"
-# Switch back to Gemini Flash for testing tool calling
-MODEL = "google/gemini-2.0-flash-exp:free" # Adjust model name as needed
+# Configure Tool LLM (e.g., Gemini Flash for tool calls)
+TOOL_PROVIDER = "openrouter"
+TOOL_MODEL = "google/gemini-2.0-flash-exp:free"
 
-agent = QwenAgent(llm_provider=PROVIDER, model_name=MODEL)
+# Configure Writer LLM (e.g., Arliai Qwen for final response)
+WRITER_PROVIDER = "openrouter"
+WRITER_MODEL = "arliai/qwq-32b-arliai-rpr-v1:free"
+
+# Ensure the corresponding API key(s) are set in your .env file
+
+agent = QwenAgent(
+    tool_llm_provider=TOOL_PROVIDER, 
+    tool_llm_model=TOOL_MODEL,
+    writer_llm_provider=WRITER_PROVIDER,
+    writer_llm_model=WRITER_MODEL
+)
 
 # Example loop for interactive chat
 while True:
