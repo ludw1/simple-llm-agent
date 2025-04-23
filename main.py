@@ -87,11 +87,26 @@ def request_files(directory: str = ".") -> str:
 
 # QwenAgent class
 class QwenAgent:
+    """An agent that uses LangGraph to orchestrate LLM calls and tool usage.
+
+    This agent can:
+    - Maintain conversation history.
+    - List files in the workspace.
+    - Use a `file_read` tool to ingest file content (text/PDF).
+    - Interact with configurable LLM providers (Ollama, OpenRouter, OpenAI).
+    """
     # Define the state for the graph
     class AgentState(TypedDict):
+        """Represents the state of the agent graph, primarily the message history."""
         messages: Annotated[list, add_messages]
 
     def __init__(self, llm_provider: str = "ollama", model_name: str = "qwen2.5:7b"):
+        """Initializes the QwenAgent.
+
+        Args:
+            llm_provider: The LLM provider to use ('ollama', 'openrouter', 'openai').
+            model_name: The specific model name for the chosen provider.
+        """
         self.chat_history = [] 
         # Define tools list - only file_read now
         _tools_list = [file_read]
@@ -150,8 +165,8 @@ class QwenAgent:
         self.graph = self._build_graph()
 
     # Define the function that lists the directory content first
-    def _list_directory(self, state):
-        """Node that calls the request_files helper to get directory content."""
+    def _list_directory(self, state: AgentState) -> dict:
+        """Graph Node: Calls the `request_files` helper and adds the result as a SystemMessage."""
         print("--- Listing Directory (Helper Call) ---")
         directory_to_list = "." # Always list the current directory
         
@@ -172,7 +187,8 @@ class QwenAgent:
         return {"messages": [list_message]}
 
     # Define the function that calls the model
-    def _call_model(self, state):
+    def _call_model(self, state: AgentState) -> dict:
+        """Graph Node: Prepares messages and invokes the LLM with tools."""
         print("--- Calling Model ---")
         messages = state["messages"]
         # Create the system message
@@ -187,7 +203,8 @@ class QwenAgent:
         return {"messages": [response]}
 
     # Define the function to execute tools
-    def _call_tool(self, state):
+    def _call_tool(self, state: AgentState) -> dict:
+        """Graph Node: Executes tools called by the LLM in the previous step."""
         print("--- Calling Tool ---")
         last_message = state["messages"][-1]
         
@@ -225,7 +242,8 @@ class QwenAgent:
         return {"messages": tool_messages}
 
     # Define the function that determines whether to continue or not
-    def _should_continue(self, state):
+    def _should_continue(self, state: AgentState) -> str:
+        """Graph Node: Determines the next step based on the last message (tool call or end)."""
         print("--- Checking if should continue ---")
         last_message = state["messages"][-1]
         # If there are no tool calls, then we finish
@@ -237,7 +255,8 @@ class QwenAgent:
             print("Decision: Continue")
             return "continue"
 
-    def _build_graph(self):
+    def _build_graph(self) -> StateGraph:
+        """Builds and compiles the LangGraph StateGraph for the agent."""
         # Graph building logic
         graph = StateGraph(self.AgentState)
 
@@ -271,8 +290,17 @@ class QwenAgent:
         print("Graph compiled successfully.")
         return compiled_graph
 
-    def generate_response(self, user_input: str):
-        """Generate a response using the LangGraph engine."""
+    def generate_response(self, user_input: str) -> str:
+        """Processes user input, runs it through the LangGraph engine, and returns the final response.
+
+        Manages chat history between invocations.
+
+        Args:
+            user_input: The user's prompt.
+
+        Returns:
+            The agent's final response string.
+        """
         # Convert user input to HumanMessage
         human_message = HumanMessage(content=user_input)
         
