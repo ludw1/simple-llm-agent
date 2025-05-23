@@ -1,5 +1,7 @@
+import logging
 import pymupdf4llm
 import os
+import time
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
@@ -14,12 +16,79 @@ from bs4 import BeautifulSoup
 from langchain_community.utilities import GoogleSerperAPIWrapper
 
 
-# --- Configuration ---
-# Maximum number of tool call iterations per user turn
-MAX_TOOL_CALLS_PER_TURN = 3
+class Config:
+    """Configuration management for the QwenAgent"""
+    
+    # Tool execution limits
+    MAX_TOOL_CALLS_PER_TURN = 10
+    MAX_CHAT_HISTORY = 20
+    
+    # File size limits
+    MAX_FILE_SIZE_MB = 50
+    MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+    
+    # Output limits
+    MAX_SEARCH_RESULT_LENGTH = 8000
+    MAX_SCRAPE_CONTENT_LENGTH = 10000
+    
+    # Encoding options
+    DEFAULT_ENCODING = "utf-8"
+    FALLBACK_ENCODING = "latin-1"
+    
+    # Request timeouts
+    WEB_REQUEST_TIMEOUT = 10
+    
+    # Log configuration
+    LOG_FILE = 'agent.log'
+    LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    
+    # Configure Tool LLM (e.g., Gemini Flash for tool calls)
+    TOOL_PROVIDER = "openrouter"
+    TOOL_MODEL = "google/gemini-2.5-flash-preview"
+
+    # Configure Writer LLM (e.g., Arliai Qwen for final response)
+    WRITER_PROVIDER = "openrouter"
+    WRITER_MODEL = "openai/gpt-4o-mini"
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format=Config.LOG_FORMAT,
+    handlers=[
+        logging.FileHandler(Config.LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
+
+
+def validate_environment():
+    """Validate that required environment variables are set"""
+    required_vars = {
+        'OPENROUTER_API_KEY': 'Required for OpenRouter LLM access',
+        'SERPER_API_KEY': 'Required for web search functionality'
+    }
+    
+    missing_vars = []
+    for var, description in required_vars.items():
+        if not os.getenv(var):
+            missing_vars.append(f"{var}: {description}")
+    
+    if missing_vars:
+        logger.warning("Missing environment variables:")
+        for var in missing_vars:
+            logger.warning(f"  - {var}")
+        print("Warning: Some features may not work without required environment variables.")
+        print("Please check your .env file and ensure all required variables are set.")
+    else:
+        logger.info("All required environment variables are set")
+
+
+# Validate environment on startup
+validate_environment()
 
 
 # --- Web Search Configuration ---
@@ -45,24 +114,30 @@ _search_tool = get_search_tool()
 @tool
 def web_search(query: str) -> str:
     """Search the web for information using Google search. Provide a clear, specific search query."""
-    print(f"Tool: Searching web for: {query}")
+    logger.info(f"Tool: Searching web for: {query}")
 
     if _search_tool is None:
-        return "Error: Web search is not available. Please check that SERPER_API_KEY is set in your environment."
+        error_msg = "Error: Web search is not available. Please check that SERPER_API_KEY is set in your environment."
+        logger.error(error_msg)
+        return error_msg
 
     try:
         # Use the search tool to get results
         results = _search_tool.run(query)
 
         # Limit output length to avoid overwhelming context
-        max_length = 8000
+        max_length = Config.MAX_SEARCH_RESULT_LENGTH
         if len(results) > max_length:
+            logger.warning(f"Search results truncated from {len(results)} to {max_length} characters")
             return results[:max_length] + "\n... (results truncated)"
 
+        logger.info(f"Search completed successfully, {len(results)} characters returned")
         return results
 
     except Exception as e:
-        return f"Error performing web search: {e}"
+        error_msg = f"Error performing web search: {e}"
+        logger.error(error_msg)
+        return error_msg
 
 
 def load_file(file_path: str) -> str:
@@ -72,21 +147,58 @@ def load_file(file_path: str) -> str:
     Returns:
         str: Content of the file.
     """
+    logger.info(f"Attempting to load file: {file_path}")
+    
     if not os.path.exists(file_path):
-        return f"Error: File '{file_path}' does not exist."
+        error_msg = f"Error: File '{file_path}' does not exist."
+        logger.error(error_msg)
+        return error_msg
 
-    if file_path.lower().endswith(".pdf"):
-        try:
-            pdf_text = pymupdf4llm.to_markdown(file_path)
-        except Exception as e:
-            pdf_text = f"Error reading {file_path}: {str(e)}"
-        return pdf_text
-    else:
-        try:
-            with open(file_path, "r") as file:
-                return file.read()
-        except Exception as e:
-            return f"Error reading {file_path}: {str(e)}"
+    try:
+        file_size = os.path.getsize(file_path)
+        logger.info(f"File size: {file_size} bytes")
+        
+        # Check for very large files
+        if file_size > Config.MAX_FILE_SIZE_BYTES:
+            error_msg = f"Error: File '{file_path}' is too large ({file_size} bytes). Maximum size is {Config.MAX_FILE_SIZE_MB}MB."
+            logger.error(error_msg)
+            return error_msg
+
+        if file_path.lower().endswith(".pdf"):
+            try:
+                logger.info("Processing PDF file")
+                pdf_text = pymupdf4llm.to_markdown(file_path)
+                logger.info(f"PDF processed successfully, {len(pdf_text)} characters extracted")
+                return pdf_text
+            except Exception as e:
+                error_msg = f"Error reading PDF {file_path}: {str(e)}"
+                logger.error(error_msg)
+                return error_msg
+        else:
+            try:
+                with open(file_path, "r", encoding=Config.DEFAULT_ENCODING) as file:
+                    content = file.read()
+                    logger.info(f"Text file processed successfully, {len(content)} characters read")
+                    return content
+            except UnicodeDecodeError:
+                try:
+                    # Try with different encoding
+                    with open(file_path, "r", encoding=Config.FALLBACK_ENCODING) as file:
+                        content = file.read()
+                        logger.info(f"Text file processed with {Config.FALLBACK_ENCODING} encoding, {len(content)} characters read")
+                        return content
+                except Exception as e:
+                    error_msg = f"Error reading {file_path} with multiple encodings: {str(e)}"
+                    logger.error(error_msg)
+                    return error_msg
+            except Exception as e:
+                error_msg = f"Error reading {file_path}: {str(e)}"
+                logger.error(error_msg)
+                return error_msg
+    except Exception as e:
+        error_msg = f"Unexpected error processing {file_path}: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
 
 
 @tool
@@ -104,7 +216,7 @@ def web_scrape(url: str) -> str:
         headers = {
             "User-Agent": "Mozilla/5.0"
         }  # Some sites block default requests user-agent
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=Config.WEB_REQUEST_TIMEOUT)
         response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -128,7 +240,7 @@ def web_scrape(url: str) -> str:
         )  # Join non-empty chunks with newline
 
         # Limit the output length to avoid overwhelming the context
-        max_length = 10000  # Adjust as needed
+        max_length = Config.MAX_SCRAPE_CONTENT_LENGTH
         if len(text) > max_length:
             return (
                 text[:max_length] + "\n... (content truncated)"
@@ -239,20 +351,34 @@ class QwenAgent:
 
         # Define the persistent system prompt message content (primarily for tool LLM)
         self.system_prompt_content = (
-            "You are an orchestrator assistant. Your primary goal is to use tools effectively to gather information needed to answer the user's query."
-            "You have access to THREE tools:"
-            "1. `file_read(file_path: str)`: Reads the content of a file specified by its full path."
-            "2. `web_scrape(url: str)`: Fetches and extracts text content from a given URL."
-            "3. `web_search(query: str)`: Searches the web for information using Google search."
-            "\n**CRITICAL INSTRUCTIONS:**"
-            "- If the user asks a question that requires information potentially contained within files listed in the context, you MUST use the `file_read` tool to fetch the content of EACH relevant file."
-            "- If the user provides a URL or asks a question that requires information from a specific webpage, you MUST use the `web_scrape` tool with the full URL (including http/https)."
-            "- If the user asks a question that requires current information or general web search, you MUST use the `web_search` tool with a clear, specific search query."
-            "- Do NOT attempt to answer the question directly yourself, even if you think you know the answer or have the information from tool calls already."
-            "- Your job is to call the tool(s). Another assistant will synthesize the final answer."
-            "- Identify the full paths of files, full URLs, or search queries you need."
-            "- Invoke the necessary tool(s) sequentially."
-            "- If no tool call is needed, or after you have made all necessary tool calls, stop and let the other assistant respond."
+            "You are an AI Job Application Research Orchestrator. Your mission is to systematically gather and organize information needed for creating tailored job applications, cover letters, and resumes.\n\n"
+            
+            "**YOUR TOOLS:**\n"
+            "1. `file_read(file_path: str)`: Read resumes, cover letters, writing samples, and other documents\n"
+            "2. `web_scrape(url: str)`: Extract detailed information from job postings and company pages\n"
+            "3. `web_search(query: str)`: Research companies, roles, industry trends, and requirements\n\n"
+            
+            "**JOB APPLICATION RESEARCH WORKFLOW:**\n"
+            "When helping with job applications, systematically gather:\n"
+            "• COMPANY INTEL: Culture, values, recent news, mission, team structure\n"
+            "• ROLE REQUIREMENTS: Technical skills, soft skills, experience levels, responsibilities\n"
+            "• INDUSTRY CONTEXT: Current trends, salary ranges, market conditions\n"
+            "• CANDIDATE PROFILE: Resume content, writing style, experience, skills\n\n"
+            
+            "**TOOL SELECTION STRATEGY:**\n"
+            "• Use `web_scrape` for specific URLs (job postings, company about pages, team pages)\n"
+            "• Use `web_search` for general research (company culture, salary data, industry trends)\n"
+            "• Use `file_read` for candidate materials (resumes, portfolios, writing samples)\n"
+            "• Always gather comprehensive information before stopping\n\n"
+            
+            "**CRITICAL INSTRUCTIONS:**\n"
+            "• Prioritize information that helps tailor applications to specific roles and companies\n"
+            "• When researching companies, focus on culture, values, and what they value in employees\n"
+            "• For job postings, extract both explicit requirements and implicit preferences\n"
+            "• Read ALL relevant candidate files to understand their background and writing style\n"
+            "• Research current market trends and expectations for the specific role/industry\n"
+            "• Your role is information gathering - a specialist writer will create the final materials\n"
+            "• Continue gathering until you have comprehensive insights for application tailoring\n"
         )
 
         # Build and compile the state graph
@@ -330,7 +456,56 @@ class QwenAgent:
         messages = state["messages"]
 
         writer_system_prompt = SystemMessage(
-            content="You are a helpful AI assistant. Synthesize the information provided in the previous messages (including tool results) to answer the user's final query comprehensively. If asked to write in a specific style, analyze the provided text samples and mimic the style in your response."
+            content=(
+                "You are an Expert Job Application Writer and Career Strategist. You specialize in creating compelling, tailored resumes, cover letters, and application materials that get results.\n\n"
+                
+                "**YOUR EXPERTISE:**\n"
+                "• Professional writing across all industries and career levels\n"
+                "• ATS-optimized resume formatting and keyword integration\n"
+                "• Persuasive cover letter structures that tell compelling stories\n"
+                "• Personal branding and value proposition development\n"
+                "• Writing style analysis and adaptive mimicry\n"
+                "• Modern hiring practices and recruiter preferences\n\n"
+                
+                "**WHEN WRITING JOB APPLICATION MATERIALS:**\n"
+                "\n1. **STYLE ANALYSIS**: If writing samples are provided, analyze:\n"
+                "   • Tone (formal, conversational, technical, creative)\n"
+                "   • Sentence structure and length preferences\n"
+                "   • Vocabulary choices and technical language use\n"
+                "   • Personality indicators and communication style\n"
+                "   • Professional voice and personal brand\n"
+                
+                "\n2. **CONTENT STRATEGY**: Based on research data, create:\n"
+                "   • Value propositions aligned with company needs\n"
+                "   • Achievement stories using STAR/CAR methodology\n"
+                "   • Keyword optimization for ATS systems\n"
+                "   • Cultural fit demonstrations\n"
+                "   • Technical skill presentations relevant to role\n"
+                
+                "\n3. **DOCUMENT FORMATS**:\n"
+                "   • RESUMES: Clean, scannable, achievement-focused, keyword-rich\n"
+                "   • COVER LETTERS: Hook, story, value, call-to-action structure\n"
+                "   • EMAILS: Professional, concise, purpose-driven\n"
+                "   • LINKEDIN MESSAGES: Personal, relevant, action-oriented\n\n"
+                
+                "**QUALITY STANDARDS:**\n"
+                "• Every claim must be substantiated with specific examples\n"
+                "• Quantify achievements with metrics when possible\n"
+                "• Match language and terminology used by the target company\n"
+                "• Demonstrate clear understanding of role requirements\n"
+                "• Show genuine interest and cultural alignment\n"
+                "• Maintain professional tone while reflecting candidate's personality\n"
+                "• Ensure ATS compatibility and recruiter appeal\n\n"
+                
+                "**OUTPUT REQUIREMENTS:**\n"
+                "• Provide clear, ready-to-use documents\n"
+                "• Include strategic explanations for key choices\n"
+                "• Offer specific customization suggestions\n"
+                "• Flag any gaps or areas needing candidate input\n"
+                "• Suggest follow-up actions and next steps\n\n"
+                
+                "Use all provided research to create materials that position the candidate as the ideal fit for the specific role and company."
+            )
         )
         messages_for_writer = [writer_system_prompt] + messages
 
@@ -344,12 +519,12 @@ class QwenAgent:
     # Define the function to execute tools
     def _call_tool(self, state: AgentState) -> dict:
         """Graph Node: Executes tools called by the LLM in the previous step."""
-        print("--- Calling Tool ---")
+        logger.info("Executing tool calls")
         last_message = state["messages"][-1]
 
         # Ensure last_message is an AIMessage with tool_calls
         if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
-            print("No valid tool calls found in the last AI message.")
+            logger.warning("No valid tool calls found in the last AI message")
             return {
                 "messages": [],
                 "tool_calls_this_turn": state.get("tool_calls_this_turn", 0),
@@ -360,21 +535,24 @@ class QwenAgent:
             tool_name = tool_call["name"]
             tool_args = tool_call["args"]
             tool_id = tool_call["id"]
-            print(f"Executing tool: {tool_name} with args {tool_args} (ID: {tool_id})")
+            logger.info(f"Executing tool: {tool_name} with args {tool_args} (ID: {tool_id})")
 
             # Look up the tool function in the map
             if tool_name not in self.tool_map:
-                print(f"Error: Tool '{tool_name}' not found.")
-                response_content = f"Error: Tool '{tool_name}' not found."
+                error_msg = f"Error: Tool '{tool_name}' not found."
+                logger.error(error_msg)
+                response_content = error_msg
             else:
                 tool_to_call = self.tool_map[tool_name]
                 try:
                     # Invoke the tool using the retrieved function object
                     response = tool_to_call.invoke(tool_args)
                     response_content = str(response)
+                    logger.info(f"Tool {tool_name} executed successfully")
                 except Exception as e:
-                    print(f"Error executing tool {tool_name}: {e}")
-                    response_content = f"Error executing tool {tool_name}: {e}"
+                    error_msg = f"Error executing tool {tool_name}: {e}"
+                    logger.error(error_msg)
+                    response_content = error_msg
 
             # Include the tool name in the ToolMessage for clarity
             tool_messages.append(
@@ -383,13 +561,11 @@ class QwenAgent:
                 )
             )
 
-        print(f"Tool responses: {tool_messages}")
         # Increment the counter for this turn
         current_count = state.get("tool_calls_this_turn", 0)
         new_count = current_count + 1
-        print(
-            f"Tool call iteration {new_count}/{MAX_TOOL_CALLS_PER_TURN} for this turn."
-        )
+        logger.info(f"Tool call iteration {new_count}/{Config.MAX_TOOL_CALLS_PER_TURN} for this turn")
+        
         # We return a list, because this will get added to the existing list (via add_messages)
         # Also return the updated counter
         return {"messages": tool_messages, "tool_calls_this_turn": new_count}
@@ -406,9 +582,9 @@ class QwenAgent:
 
         if has_tool_calls:
             # Check if we've exceeded the limit for this turn
-            if tool_calls_made >= MAX_TOOL_CALLS_PER_TURN:
+            if tool_calls_made >= Config.MAX_TOOL_CALLS_PER_TURN:
                 print(
-                    f"Decision: Tool call limit ({MAX_TOOL_CALLS_PER_TURN}) reached. Forcing end of tool loop."
+                    f"Decision: Tool call limit ({Config.MAX_TOOL_CALLS_PER_TURN}) reached. Forcing end of tool loop."
                 )
                 return "end"
             else:
@@ -472,6 +648,9 @@ class QwenAgent:
         Returns:
             The agent's final response string.
         """
+        start_time = time.time()
+        logger.info(f"Processing user input: {user_input[:100]}...")
+        
         # Convert user input to HumanMessage
         human_message = HumanMessage(content=user_input)
 
@@ -483,61 +662,85 @@ class QwenAgent:
         # Prepare the initial state for this invocation using the history
         # Initialize the tool call counter for this turn
         initial_state = {"messages": self.chat_history, "tool_calls_this_turn": 0}
-        print(f"Invoking graph with state: {initial_state}")
+        logger.info(f"Invoking graph with {len(self.chat_history)} messages in history")
 
-        # Invoke the graph
-        # The `+` operator in AgentState definition handles message accumulation
-        final_state = self.graph.invoke(initial_state)
-        print(f"Final graph state: {final_state}")
+        try:
+            # Invoke the graph
+            # The `+` operator in AgentState definition handles message accumulation
+            graph_start = time.time()
+            final_state = self.graph.invoke(initial_state)
+            graph_time = time.time() - graph_start
+            logger.info(f"Graph execution completed in {graph_time:.2f} seconds")
 
-        # Extract the final AI response from the graph state
-        # The last message should be the AI's response after potentially multiple tool calls/responses
-        final_ai_message = final_state["messages"][-1]
-        final_response = (
-            final_ai_message.content
-            if isinstance(final_ai_message, AIMessage)
-            else "Error: Expected AIMessage at the end."
-        )
+            # Extract the final AI response from the graph state
+            # The last message should be the AI's response after potentially multiple tool calls/responses
+            final_ai_message = final_state["messages"][-1]
+            
+            if isinstance(final_ai_message, AIMessage):
+                final_response = final_ai_message.content
+                
+                # Validation: Check if response seems complete
+                if final_response and len(final_response) > 10:
+                    total_time = time.time() - start_time
+                    logger.info(f"Generated response: {len(final_response)} characters in {total_time:.2f} seconds")
+                else:
+                    logger.warning("Generated response seems incomplete or empty")
+            else:
+                error_msg = "Error: Expected AIMessage at the end of processing."
+                logger.error(error_msg)
+                final_response = error_msg
 
-        # Append the final AI response to the history for the next turn
-        self.chat_history.append(final_ai_message)
+            # Append the final AI response to the history for the next turn
+            self.chat_history.append(final_ai_message)
 
-        # Limit history size (optional, but good practice)
-        # self.chat_history = self.chat_history[-10:] # Keep last 5 pairs
+            # Limit history size to prevent context overflow
+            if len(self.chat_history) > Config.MAX_CHAT_HISTORY:
+                logger.info("Trimming chat history to maintain context size")
+                self.chat_history = self.chat_history[-Config.MAX_CHAT_HISTORY:]
 
-        print("Final Response:", final_response)
-        # Return the response content string
-        return final_response
+            logger.info("Response generation completed successfully")
+            return final_response
+            
+        except Exception as e:
+            error_msg = f"Error during graph execution: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
 
-
-# Example usage:
-# Configure Tool LLM (e.g., Gemini Flash for tool calls)
-TOOL_PROVIDER = "openrouter"
-TOOL_MODEL = "google/gemini-2.5-flash-preview"
-
-# Configure Writer LLM (e.g., Arliai Qwen for final response)
-WRITER_PROVIDER = "openrouter"
-WRITER_MODEL = "openai/gpt-4o-mini"
-
-# Ensure the corresponding API key(s) are set in your .env file
 
 agent = QwenAgent(
-    tool_llm_provider=TOOL_PROVIDER,
-    tool_llm_model=TOOL_MODEL,
-    writer_llm_provider=WRITER_PROVIDER,
-    writer_llm_model=WRITER_MODEL,
+    tool_llm_provider=Config.TOOL_PROVIDER,
+    tool_llm_model=Config.TOOL_MODEL,
+    writer_llm_provider=Config.WRITER_PROVIDER,
+    writer_llm_model=Config.WRITER_MODEL,
 )
 
 # Example loop for interactive chat
 while True:
     try:
         prompt = input("Enter prompt (or 'quit' to exit): ")
-        if prompt.lower() == "quit":
+        if prompt.lower() in ['quit', 'exit', 'q']:
+            logger.info("User requested exit")
             break
-        agent.generate_response(prompt)
+        
+        # Input validation
+        if not prompt.strip():
+            print("Please enter a non-empty prompt.")
+            continue
+            
+        if len(prompt) > 10000:
+            print("Prompt too long. Please limit to 10,000 characters.")
+            continue
+            
+        logger.info("Processing user request")
+        response = agent.generate_response(prompt)
+        print(f"\nAgent Response:\n{response}\n")
+        
     except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt")
         print("\nExiting...")
         break
     except Exception as e:
+        logger.error(f"Unexpected error in main loop: {e}")
         print(f"An error occurred: {e}")
+        print("Continuing...")
 # agent.generate_response(prompt) # Remove single execution line
