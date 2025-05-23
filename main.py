@@ -11,14 +11,59 @@ from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated
 import requests
 from bs4 import BeautifulSoup
+from langchain_community.utilities import GoogleSerperAPIWrapper
 
 
-# --- Configuration --- 
+# --- Configuration ---
 # Maximum number of tool call iterations per user turn
-MAX_TOOL_CALLS_PER_TURN = 3 
+MAX_TOOL_CALLS_PER_TURN = 3
 
 # Load environment variables from .env file
 load_dotenv()
+
+
+# --- Web Search Configuration ---
+def get_search_tool():
+    """Initialize and return the web search tool."""
+    serper_api_key = os.getenv("SERPER_API_KEY")
+    if not serper_api_key:
+        print("Warning: SERPER_API_KEY not found. Web search will not be available.")
+        return None
+
+    try:
+        search = GoogleSerperAPIWrapper(serper_api_key=serper_api_key)
+        return search
+    except Exception as e:
+        print(f"Error initializing web search: {e}")
+        return None
+
+
+# Initialize the search tool
+_search_tool = get_search_tool()
+
+
+@tool
+def web_search(query: str) -> str:
+    """Search the web for information using Google search. Provide a clear, specific search query."""
+    print(f"Tool: Searching web for: {query}")
+
+    if _search_tool is None:
+        return "Error: Web search is not available. Please check that SERPER_API_KEY is set in your environment."
+
+    try:
+        # Use the search tool to get results
+        results = _search_tool.run(query)
+
+        # Limit output length to avoid overwhelming context
+        max_length = 8000
+        if len(results) > max_length:
+            return results[:max_length] + "\n... (results truncated)"
+
+        return results
+
+    except Exception as e:
+        return f"Error performing web search: {e}"
+
 
 def load_file(file_path: str) -> str:
     """Load a file and return its content. Depending on the file type, different methods can be used to read it.
@@ -29,7 +74,7 @@ def load_file(file_path: str) -> str:
     """
     if not os.path.exists(file_path):
         return f"Error: File '{file_path}' does not exist."
-    
+
     if file_path.lower().endswith(".pdf"):
         try:
             pdf_text = pymupdf4llm.to_markdown(file_path)
@@ -43,22 +88,26 @@ def load_file(file_path: str) -> str:
         except Exception as e:
             return f"Error reading {file_path}: {str(e)}"
 
+
 @tool
 def file_read(file_path: str) -> str:
     """Fetch content from a specified file. Supports reading text files and extracting text from PDF files. Provide the full file path."""
     print(f"Tool: Reading file: {file_path}")
     return load_file(file_path)
 
+
 @tool
 def web_scrape(url: str) -> str:
     """Fetches and extracts text content from a given URL. Provide the full URL including http/https."""
     print(f"Tool: Scraping web page: {url}")
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'} # Some sites block default requests user-agent
+        headers = {
+            "User-Agent": "Mozilla/5.0"
+        }  # Some sites block default requests user-agent
         response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
 
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.text, "html.parser")
 
         # Remove script and style elements
         for script_or_style in soup(["script", "style"]):
@@ -68,20 +117,29 @@ def web_scrape(url: str) -> str:
         text = soup.get_text()
         lines = (line.strip() for line in text.splitlines())
         # Further process lines to handle extra spaces robustly before joining
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  ") if phrase.strip()) # Filter empty strings after splitting by double space
-        text = '\n'.join(chunk for chunk in chunks if chunk) # Join non-empty chunks with newline
-
+        chunks = (
+            phrase.strip()
+            for line in lines
+            for phrase in line.split("  ")
+            if phrase.strip()
+        )  # Filter empty strings after splitting by double space
+        text = "\n".join(
+            chunk for chunk in chunks if chunk
+        )  # Join non-empty chunks with newline
 
         # Limit the output length to avoid overwhelming the context
-        max_length = 10000 # Adjust as needed
+        max_length = 10000  # Adjust as needed
         if len(text) > max_length:
-             return text[:max_length] + '\n... (content truncated)' # Ensure newline in truncation message
+            return (
+                text[:max_length] + "\n... (content truncated)"
+            )  # Ensure newline in truncation message
         return text
 
     except requests.exceptions.RequestException as e:
         return f"Error fetching URL {url}: {e}"
     except Exception as e:
         return f"Error processing URL {url}: {e}"
+
 
 # Make request_files a regular helper function, no longer a tool
 def request_files(directory: str = ".") -> str:
@@ -92,12 +150,16 @@ def request_files(directory: str = ".") -> str:
     try:
         abs_directory = os.path.abspath(directory)
         if not os.path.isdir(abs_directory):
-            return f"Error: Directory '{directory}' does not exist or is not accessible."
+            return (
+                f"Error: Directory '{directory}' does not exist or is not accessible."
+            )
 
         for root, dirs, files in os.walk(abs_directory, topdown=True):
             # Filter directories to avoid traversing into them
-            dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__', '.vscode', '.venv')]
-            
+            dirs[:] = [
+                d for d in dirs if d not in (".git", "__pycache__", ".vscode", ".venv")
+            ]
+
             # Collect full paths for files in the current directory
             for filename in files:
                 # Optional: Filter specific files like .gitignore if needed
@@ -110,13 +172,14 @@ def request_files(directory: str = ".") -> str:
 
         if not file_paths:
             return "No files found in the specified directory."
-            
+
         # Format the output as a simple list
         return "\nAvailable files:\n" + "\n".join(sorted(file_paths))
 
     except Exception as e:
-        print(f"Error during os.walk in {directory}: {str(e)}") 
+        print(f"Error during os.walk in {directory}: {str(e)}")
         return f"Error listing files in directory {directory}: {str(e)}"
+
 
 # QwenAgent class
 class QwenAgent:
@@ -130,20 +193,23 @@ class QwenAgent:
     - Interact with configurable LLM providers (Ollama, OpenRouter, OpenAI).
     - Optionally use separate LLMs for tool usage and final writing.
     """
+
     # Define the state for the graph
     class AgentState(TypedDict):
         """Represents the state of the agent graph, primarily the message history."""
+
         messages: Annotated[list, add_messages]
         # Add counter for tool calls within a turn
         tool_calls_this_turn: int
 
     # Update __init__ for two LLMs
-    def __init__(self, 
-                 tool_llm_provider: str = "openrouter", 
-                 tool_llm_model: str = "google/gemini-2.0-flash-exp:free",
-                 writer_llm_provider: str = "openrouter",
-                 writer_llm_model: str = "arliai/qwq-32b-arliai-rpr-v1:free"
-                 ):
+    def __init__(
+        self,
+        tool_llm_provider: str = "openrouter",
+        tool_llm_model: str = "google/gemini-2.0-flash-exp:free",
+        writer_llm_provider: str = "openrouter",
+        writer_llm_model: str = "arliai/qwq-32b-arliai-rpr-v1:free",
+    ):
         """Initializes the QwenAgent with potentially separate tool and writer LLMs.
 
         Args:
@@ -153,32 +219,38 @@ class QwenAgent:
             writer_llm_model: The model name for the writer LLM.
         """
         self.chat_history = []
-        _tools_list = [file_read, web_scrape]
+        _tools_list = [file_read, web_scrape, web_search]
         self.tool_map = {tool.name: tool for tool in _tools_list}
 
-        # --- Initialize Tool LLM --- 
-        print(f"Initializing Tool LLM: Provider={tool_llm_provider}, Model={tool_llm_model}")
+        # --- Initialize Tool LLM ---
+        print(
+            f"Initializing Tool LLM: Provider={tool_llm_provider}, Model={tool_llm_model}"
+        )
         self.tool_llm = self._initialize_llm(tool_llm_provider, tool_llm_model)
         # Bind tools ONLY to the tool_llm
         self.tool_llm_with_tools = self.tool_llm.bind_tools(_tools_list)
 
-        # --- Initialize Writer LLM --- 
-        print(f"Initializing Writer LLM: Provider={writer_llm_provider}, Model={writer_llm_model}")
+        # --- Initialize Writer LLM ---
+        print(
+            f"Initializing Writer LLM: Provider={writer_llm_provider}, Model={writer_llm_model}"
+        )
         # Initialize writer LLM WITHOUT binding tools
         self.writer_llm = self._initialize_llm(writer_llm_provider, writer_llm_model)
 
         # Define the persistent system prompt message content (primarily for tool LLM)
         self.system_prompt_content = (
             "You are an orchestrator assistant. Your primary goal is to use tools effectively to gather information needed to answer the user's query."
-            "You have access to TWO tools:"
+            "You have access to THREE tools:"
             "1. `file_read(file_path: str)`: Reads the content of a file specified by its full path."
             "2. `web_scrape(url: str)`: Fetches and extracts text content from a given URL."
+            "3. `web_search(query: str)`: Searches the web for information using Google search."
             "\n**CRITICAL INSTRUCTIONS:**"
             "- If the user asks a question that requires information potentially contained within files listed in the context, you MUST use the `file_read` tool to fetch the content of EACH relevant file."
             "- If the user provides a URL or asks a question that requires information from a specific webpage, you MUST use the `web_scrape` tool with the full URL (including http/https)."
+            "- If the user asks a question that requires current information or general web search, you MUST use the `web_search` tool with a clear, specific search query."
             "- Do NOT attempt to answer the question directly yourself, even if you think you know the answer or have the information from tool calls already."
             "- Your job is to call the tool(s). Another assistant will synthesize the final answer."
-            "- Identify the full paths of files or full URLs you need to fetch."
+            "- Identify the full paths of files, full URLs, or search queries you need."
             "- Invoke the necessary tool(s) sequentially."
             "- If no tool call is needed, or after you have made all necessary tool calls, stop and let the other assistant respond."
         )
@@ -193,17 +265,21 @@ class QwenAgent:
         elif provider == "openrouter":
             api_key = os.getenv("OPENROUTER_API_KEY")
             if not api_key:
-                raise ValueError("OPENROUTER_API_KEY not found in environment or .env file.")
+                raise ValueError(
+                    "OPENROUTER_API_KEY not found in environment or .env file."
+                )
             return ChatOpenAI(
                 model=model_name,
                 temperature=0.2,
                 openai_api_key=api_key,
-                openai_api_base="https://openrouter.ai/api/v1"
+                openai_api_base="https://openrouter.ai/api/v1",
             )
         elif provider == "openai":
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                raise ValueError("OPENAI_API_KEY not found in environment or .env file.")
+                raise ValueError(
+                    "OPENAI_API_KEY not found in environment or .env file."
+                )
             return ChatOpenAI(model=model_name, temperature=0.2, openai_api_key=api_key)
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -212,8 +288,8 @@ class QwenAgent:
     def _list_directory(self, state: AgentState) -> dict:
         """Graph Node: Calls the `request_files` helper and adds the result as a SystemMessage."""
         print("--- Listing Directory (Helper Call) ---")
-        directory_to_list = "." # Always list the current directory
-        
+        directory_to_list = "."  # Always list the current directory
+
         # Directly call the helper function
         try:
             response = request_files(directory_to_list)
@@ -246,14 +322,16 @@ class QwenAgent:
         # Note: We only return the LLM's response, not the system prompt we added
         return {"messages": [response]}
 
-    # --- New Node: Call Writer LLM --- 
+    # --- New Node: Call Writer LLM ---
     def _call_writer_model(self, state: AgentState) -> dict:
         """Graph Node: Invokes the writer LLM to synthesize the final response."""
         print("--- Calling Writer Model ---")
         # Get all messages except the initial system prompt for the tool_llm
         messages = state["messages"]
-        
-        writer_system_prompt = SystemMessage(content="You are a helpful AI assistant. Synthesize the information provided in the previous messages (including tool results) to answer the user's final query comprehensively. If asked to write in a specific style, analyze the provided text samples and mimic the style in your response.")
+
+        writer_system_prompt = SystemMessage(
+            content="You are a helpful AI assistant. Synthesize the information provided in the previous messages (including tool results) to answer the user's final query comprehensively. If asked to write in a specific style, analyze the provided text samples and mimic the style in your response."
+        )
         messages_for_writer = [writer_system_prompt] + messages
 
         print(f"Messages sent to Writer LLM: {messages_for_writer}")
@@ -268,11 +346,14 @@ class QwenAgent:
         """Graph Node: Executes tools called by the LLM in the previous step."""
         print("--- Calling Tool ---")
         last_message = state["messages"][-1]
-        
+
         # Ensure last_message is an AIMessage with tool_calls
         if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
-             print("No valid tool calls found in the last AI message.")
-             return {"messages": [], "tool_calls_this_turn": state.get('tool_calls_this_turn', 0)} 
+            print("No valid tool calls found in the last AI message.")
+            return {
+                "messages": [],
+                "tool_calls_this_turn": state.get("tool_calls_this_turn", 0),
+            }
 
         tool_messages = []
         for tool_call in last_message.tool_calls:
@@ -280,7 +361,7 @@ class QwenAgent:
             tool_args = tool_call["args"]
             tool_id = tool_call["id"]
             print(f"Executing tool: {tool_name} with args {tool_args} (ID: {tool_id})")
-            
+
             # Look up the tool function in the map
             if tool_name not in self.tool_map:
                 print(f"Error: Tool '{tool_name}' not found.")
@@ -296,13 +377,19 @@ class QwenAgent:
                     response_content = f"Error executing tool {tool_name}: {e}"
 
             # Include the tool name in the ToolMessage for clarity
-            tool_messages.append(ToolMessage(content=response_content, name=tool_name, tool_call_id=tool_id))
+            tool_messages.append(
+                ToolMessage(
+                    content=response_content, name=tool_name, tool_call_id=tool_id
+                )
+            )
 
         print(f"Tool responses: {tool_messages}")
         # Increment the counter for this turn
-        current_count = state.get('tool_calls_this_turn', 0)
+        current_count = state.get("tool_calls_this_turn", 0)
         new_count = current_count + 1
-        print(f"Tool call iteration {new_count}/{MAX_TOOL_CALLS_PER_TURN} for this turn.")
+        print(
+            f"Tool call iteration {new_count}/{MAX_TOOL_CALLS_PER_TURN} for this turn."
+        )
         # We return a list, because this will get added to the existing list (via add_messages)
         # Also return the updated counter
         return {"messages": tool_messages, "tool_calls_this_turn": new_count}
@@ -312,19 +399,23 @@ class QwenAgent:
         """Graph Node: Determines the next step based on the last message and tool call limit."""
         print("--- Checking if should continue ---")
         last_message = state["messages"][-1]
-        tool_calls_made = state.get('tool_calls_this_turn', 0)
-        
+        tool_calls_made = state.get("tool_calls_this_turn", 0)
+
         # Check if the LLM requested tool calls
-        has_tool_calls = hasattr(last_message, 'tool_calls') and last_message.tool_calls
+        has_tool_calls = hasattr(last_message, "tool_calls") and last_message.tool_calls
 
         if has_tool_calls:
             # Check if we've exceeded the limit for this turn
             if tool_calls_made >= MAX_TOOL_CALLS_PER_TURN:
-                print(f"Decision: Tool call limit ({MAX_TOOL_CALLS_PER_TURN}) reached. Forcing end of tool loop.")
+                print(
+                    f"Decision: Tool call limit ({MAX_TOOL_CALLS_PER_TURN}) reached. Forcing end of tool loop."
+                )
                 return "end"
             else:
                 # Limit not reached, continue tool execution
-                print(f"Decision: Continue tool execution (Iteration {tool_calls_made + 1})")
+                print(
+                    f"Decision: Continue tool execution (Iteration {tool_calls_made + 1})"
+                )
                 return "continue"
         else:
             # No tool calls requested by LLM
@@ -342,19 +433,19 @@ class QwenAgent:
         graph.add_node("action", self._call_tool)
         graph.add_node("writer", self._call_writer_model)
 
-        # Set the entrypoint 
+        # Set the entrypoint
         graph.set_entry_point("list_directory")
 
         # Add edges
         graph.add_edge("list_directory", "agent")
-        
+
         # Conditional edges from agent
         graph.add_conditional_edges(
             "agent",
             self._should_continue,
             {
-                "continue": "action", # If tool call needed, go to action
-                "end": "writer",      # If no tool call needed, go to writer
+                "continue": "action",  # If tool call needed, go to action
+                "end": "writer",  # If no tool call needed, go to writer
             },
         )
 
@@ -383,7 +474,7 @@ class QwenAgent:
         """
         # Convert user input to HumanMessage
         human_message = HumanMessage(content=user_input)
-        
+
         # Append user message to internal chat history for context in next turn
         # Note: LangGraph state `messages` handles history *within* a single run.
         # We need self.chat_history to maintain context *between* runs.
@@ -401,18 +492,23 @@ class QwenAgent:
 
         # Extract the final AI response from the graph state
         # The last message should be the AI's response after potentially multiple tool calls/responses
-        final_ai_message = final_state['messages'][-1]
-        final_response = final_ai_message.content if isinstance(final_ai_message, AIMessage) else "Error: Expected AIMessage at the end."
-        
+        final_ai_message = final_state["messages"][-1]
+        final_response = (
+            final_ai_message.content
+            if isinstance(final_ai_message, AIMessage)
+            else "Error: Expected AIMessage at the end."
+        )
+
         # Append the final AI response to the history for the next turn
         self.chat_history.append(final_ai_message)
-        
+
         # Limit history size (optional, but good practice)
         # self.chat_history = self.chat_history[-10:] # Keep last 5 pairs
 
         print("Final Response:", final_response)
         # Return the response content string
         return final_response
+
 
 # Example usage:
 # Configure Tool LLM (e.g., Gemini Flash for tool calls)
@@ -426,17 +522,17 @@ WRITER_MODEL = "openai/gpt-4o-mini"
 # Ensure the corresponding API key(s) are set in your .env file
 
 agent = QwenAgent(
-    tool_llm_provider=TOOL_PROVIDER, 
+    tool_llm_provider=TOOL_PROVIDER,
     tool_llm_model=TOOL_MODEL,
     writer_llm_provider=WRITER_PROVIDER,
-    writer_llm_model=WRITER_MODEL
+    writer_llm_model=WRITER_MODEL,
 )
 
 # Example loop for interactive chat
 while True:
     try:
         prompt = input("Enter prompt (or 'quit' to exit): ")
-        if prompt.lower() == 'quit':
+        if prompt.lower() == "quit":
             break
         agent.generate_response(prompt)
     except KeyboardInterrupt:
