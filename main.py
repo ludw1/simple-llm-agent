@@ -9,7 +9,8 @@ from langchain_core.messages import SystemMessage
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated
-from langchain_core.prompts import ChatPromptTemplate
+import requests
+from bs4 import BeautifulSoup
 
 
 # --- Configuration --- 
@@ -47,6 +48,40 @@ def file_read(file_path: str) -> str:
     """Fetch content from a specified file. Supports reading text files and extracting text from PDF files. Provide the full file path."""
     print(f"Tool: Reading file: {file_path}")
     return load_file(file_path)
+
+@tool
+def web_scrape(url: str) -> str:
+    """Fetches and extracts text content from a given URL. Provide the full URL including http/https."""
+    print(f"Tool: Scraping web page: {url}")
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'} # Some sites block default requests user-agent
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Remove script and style elements
+        for script_or_style in soup(["script", "style"]):
+            script_or_style.decompose()
+
+        # Get text, strip leading/trailing whitespace, reduce multiple newlines/spaces
+        text = soup.get_text()
+        lines = (line.strip() for line in text.splitlines())
+        # Further process lines to handle extra spaces robustly before joining
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  ") if phrase.strip()) # Filter empty strings after splitting by double space
+        text = '\n'.join(chunk for chunk in chunks if chunk) # Join non-empty chunks with newline
+
+
+        # Limit the output length to avoid overwhelming the context
+        max_length = 10000 # Adjust as needed
+        if len(text) > max_length:
+             return text[:max_length] + '\n... (content truncated)' # Ensure newline in truncation message
+        return text
+
+    except requests.exceptions.RequestException as e:
+        return f"Error fetching URL {url}: {e}"
+    except Exception as e:
+        return f"Error processing URL {url}: {e}"
 
 # Make request_files a regular helper function, no longer a tool
 def request_files(directory: str = ".") -> str:
@@ -91,6 +126,7 @@ class QwenAgent:
     - Maintain conversation history.
     - List files in the workspace.
     - Use a `file_read` tool to ingest file content (text/PDF).
+    - Use a `web_scrape` tool to fetch content from URLs.
     - Interact with configurable LLM providers (Ollama, OpenRouter, OpenAI).
     - Optionally use separate LLMs for tool usage and final writing.
     """
@@ -117,7 +153,7 @@ class QwenAgent:
             writer_llm_model: The model name for the writer LLM.
         """
         self.chat_history = []
-        _tools_list = [file_read]
+        _tools_list = [file_read, web_scrape]
         self.tool_map = {tool.name: tool for tool in _tools_list}
 
         # --- Initialize Tool LLM --- 
@@ -134,13 +170,17 @@ class QwenAgent:
         # Define the persistent system prompt message content (primarily for tool LLM)
         self.system_prompt_content = (
             "You are an orchestrator assistant. Your primary goal is to use tools effectively to gather information needed to answer the user's query."
-            "You have access to ONE tool: `file_read(file_path: str)` which allows you to read the content of a file specified by its full path."
-            "\n**CRITICAL INSTRUCTION:** If the user asks a question that requires information potentially contained within files listed in the context, you MUST use the `file_read` tool to fetch the content of EACH relevant file."
-            "Do NOT attempt to answer the question directly yourself, even if you think you know the answer or have the information from tool calls already."
-            "Your job is to call the tool(s). Another assistant will synthesize the final answer."
-            "Identify the full paths of the files you need to read from the context."
-            "Then, invoke the `file_read` tool for each file path sequentially."
-            "If no tool call is needed, or after you have made all necessary tool calls, stop and let the other assistant respond."
+            "You have access to TWO tools:"
+            "1. `file_read(file_path: str)`: Reads the content of a file specified by its full path."
+            "2. `web_scrape(url: str)`: Fetches and extracts text content from a given URL."
+            "\n**CRITICAL INSTRUCTIONS:**"
+            "- If the user asks a question that requires information potentially contained within files listed in the context, you MUST use the `file_read` tool to fetch the content of EACH relevant file."
+            "- If the user provides a URL or asks a question that requires information from a specific webpage, you MUST use the `web_scrape` tool with the full URL (including http/https)."
+            "- Do NOT attempt to answer the question directly yourself, even if you think you know the answer or have the information from tool calls already."
+            "- Your job is to call the tool(s). Another assistant will synthesize the final answer."
+            "- Identify the full paths of files or full URLs you need to fetch."
+            "- Invoke the necessary tool(s) sequentially."
+            "- If no tool call is needed, or after you have made all necessary tool calls, stop and let the other assistant respond."
         )
 
         # Build and compile the state graph
@@ -377,11 +417,11 @@ class QwenAgent:
 # Example usage:
 # Configure Tool LLM (e.g., Gemini Flash for tool calls)
 TOOL_PROVIDER = "openrouter"
-TOOL_MODEL = "google/gemini-2.0-flash-exp:free"
+TOOL_MODEL = "google/gemini-2.5-flash-preview"
 
 # Configure Writer LLM (e.g., Arliai Qwen for final response)
 WRITER_PROVIDER = "openrouter"
-WRITER_MODEL = "arliai/qwq-32b-arliai-rpr-v1:free"
+WRITER_MODEL = "openai/gpt-4o-mini"
 
 # Ensure the corresponding API key(s) are set in your .env file
 
