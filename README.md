@@ -2,7 +2,6 @@
 
 This project demonstrates an AI agent built using LangGraph with comprehensive tool integration. The agent combines file reading, web scraping, and web search capabilities to provide intelligent responses for various use cases, particularly **automated job application creation and career assistance**. The goal is to pass a LinkedIn job posting to the agent, have it read the website, ingest various webpages and documents of my own writing and output material which I can use to apply to the job. However, it is mostly an exercise to get acquainted with LangGraph and agentic LLM usage.
 
-This project serves as a flagship portfolio piece showcasing:
 *   Implementation of a stateful agent using LangGraph with 2 different LLMs
 *   Integration of multiple LLM tools (`file_read`, `web_scrape`, `web_search`)
 *   Support for multiple LLM providers (Ollama, OpenRouter, OpenAI)
@@ -138,16 +137,3 @@ WRITER_MODEL = "openai/gpt-4o-mini"
 *   Maximum 10 tool calls per user turn (configurable)
 *   Web search results limited to 8,000 characters
 *   Web scraping limited to 10,000 characters
-
-
-## Contributing
-
-This project is designed as a portfolio piece and learning resource. Feel free to:
-*   Fork and extend with additional tools
-*   Improve prompts for specific industries
-*   Add new document types (LinkedIn profiles, portfolios)
-*   Enhance the user interface
-
-## License
-
-MIT License - see LICENSE file for details. 
